@@ -103,7 +103,8 @@ class MusicTransformer(nn.Module):
         
         with torch.no_grad():
             new_mems = []
-            end_idx = mlen + qlen
+            # Cache up to mem_len tokens, skipping the most recent `ext_len`
+            end_idx = mlen + max(0, qlen - self.ext_len)
             beg_idx = max(0, end_idx - self.mem_len)
             for i in range(len(hids)):
                 cat = torch.cat([mems[i], hids[i]], dim=0)
@@ -161,7 +162,11 @@ class MusicTransformer(nn.Module):
         
         pred_hid = hidden
         output = self.out_layer(pred_hid)
-        output = output.transpose(0, 1).contiguous()  # (batch, seq, vocab)
+        output = output.transpose(0, 1).contiguous()
+        
+        print("Input shape:", data.shape)
+        print("Output shape:", output.shape)
+        print("Number of memory states:", len(mems) if mems else 0)
         
         return output, new_mems
 
@@ -213,17 +218,25 @@ class TransformerLayer(nn.Module):
         klen = c.size(0)
         
         # Compute q from current input
-        q = self.q_net(h)  # (qlen, bsz, n_head * d_head)
-        q = q.view(qlen, -1, self.n_head, self.d_head)  # (qlen, bsz, n_head, d_head)
-        q = q.permute(2, 1, 0, 3)  # (n_head, bsz, qlen, d_head)
+        q = self.q_net(h)
         
         # Compute k, v from concatenated sequence (includes memory)
-        kv = self.kv_net(c)  # (klen, bsz, 2 * n_head * d_head)
+        kv = self.kv_net(c)
         k, v = torch.chunk(kv, 2, dim=-1)
-        k = k.view(klen, -1, self.n_head, self.d_head)  # (klen, bsz, n_head, d_head)
-        k = k.permute(2, 1, 0, 3)  # (n_head, bsz, klen, d_head)
-        v = v.view(klen, -1, self.n_head, self.d_head)  # (klen, bsz, n_head, d_head)
-        v = v.permute(2, 1, 0, 3)  # (n_head, bsz, klen, d_head)
+        k = k.view(klen, -1, self.n_head, self.d_head)
+        k = k.permute(2, 1, 0, 3)
+        v = v.view(klen, -1, self.n_head, self.d_head)
+        v = v.permute(2, 1, 0, 3)
+        
+        # --- Apply rotary positional embeddings to q and k ---
+        sin, cos = _get_sin_cos(
+            klen, self.d_head, device=q.device, dtype=q.dtype
+        )
+        sin = sin.unsqueeze(0).unsqueeze(0)  # 1,1,klen,d_head
+        cos = cos.unsqueeze(0).unsqueeze(0)
+
+        q = _apply_rotary(q, sin[:, :, -qlen:, :], cos[:, :, -qlen:, :])
+        k = _apply_rotary(k, sin, cos)
         
         # Attention scores
         attn_score = torch.matmul(q, k.transpose(-1, -2))
@@ -240,8 +253,8 @@ class TransformerLayer(nn.Module):
         
         # Attention output
         attn_vec = torch.matmul(attn_prob, v)
-        attn_vec = attn_vec.transpose(1, 2).contiguous().view(
-            qlen, -1, self.n_head * self.d_head)
+        attn_vec = attn_vec.transpose(1, 2).contiguous()
+        attn_vec = attn_vec.view(qlen, -1, self.n_head * self.d_head)
         
         # Linear projection
         attn_out = self.o_net(attn_vec)
@@ -264,6 +277,39 @@ class TransformerLayer(nn.Module):
             output = self.layer_norm2(output + output2)
         
         return output
+
+
+# --- Rotary positional embedding helpers (relative positional information) ---
+
+
+def _get_sin_cos(seq_len: int, d_head: int, device, dtype):
+    """Return sinusoid sin and cos matrices used for rotary embeddings.
+
+    Both tensors have shape (seq_len, d_head) and are ready for broadcasting.
+    They will later be unsqueezed to 1, 1, seq_len, d_head before use.
+    """
+    arange = torch.arange(0, d_head, 2, device=device, dtype=dtype)
+    inv_freq = 1.0 / (10000 ** (arange / d_head))
+    positions = torch.arange(seq_len, device=device, dtype=dtype)
+    sinusoid_inp = torch.einsum('i,j->ij', positions, inv_freq)
+    sin = torch.repeat_interleave(torch.sin(sinusoid_inp), 2, dim=-1)
+    cos = torch.repeat_interleave(torch.cos(sinusoid_inp), 2, dim=-1)
+    return sin, cos
+
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Helper that swaps and negates every other dimension (used by RoPE)."""
+    x_even = x[..., ::2]
+    x_odd = x[..., 1::2]
+    rotated = torch.stack((-x_odd, x_even), dim=-1)
+    return rotated.flatten(-2)
+
+
+def _apply_rotary(x: torch.Tensor, sin: torch.Tensor, cos: torch.Tensor) -> torch.Tensor:
+    """Apply rotary positional embedding to x (… d_head)."""
+    # (x * cos) + (rotate_half(x) * sin)
+    rotated_component = _rotate_half(x) * sin
+    return (x * cos) + rotated_component
 
 
 # Example usage and testing
@@ -290,6 +336,6 @@ if __name__ == "__main__":
     input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
     output, mems = model(input_ids)
     
-    print(f"Input shape: {input_ids.shape}")
-    print(f"Output shape: {output.shape}")
-    print(f"Number of memory states: {len(mems) if mems else 0}") 
+    print("Input shape:", input_ids.shape)
+    print("Output shape:", output.shape)
+    print("Number of memory states:", len(mems) if mems else 0) 
